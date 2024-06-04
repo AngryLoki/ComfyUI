@@ -481,3 +481,68 @@ class ProgressBar:
 
     def update(self, value):
         self.update_absolute(self.current + value)
+
+_mkl_is_crippled = None
+_cpu_supports_bf16 = None
+
+def _collect_cpu_info():
+    """
+    Collect some flags, remember results.
+    Imports are deferred to reduce startup time.
+    """
+    global _mkl_is_crippled, _cpu_supports_bf16
+ 
+    if _mkl_is_crippled is not None:
+        return
+
+    from cpuinfo import get_cpu_info
+
+    cpu_info = get_cpu_info()
+    is_intel = cpu_info.get('vendor_id_raw') == 'GenuineIntel'
+    has_avx512f = 'avx512f' in cpu_info['flags']
+    
+    _cpu_supports_bf16 = 'avx512_bf16' in cpu_info['flags']
+
+    # All Intel CPUs are ok, non AVX512 CPUs are probably ok
+    if is_intel or not has_avx512f:
+        _mkl_is_crippled = False
+        return
+ 
+    _mkl_is_crippled = True
+
+    import os
+    if os.name == 'nt':
+        # non-intel MKL on Windows is always crippled and slow
+        return
+
+    # Search for preloaded symbol mkl_serv_intel_cpu_true.
+    # If CPU supports avx512_bf16, but symbol is not defined,
+    # MKL will be extremely slow.
+    import ctypes
+    import ctypes.util
+
+    try:
+        libdl = ctypes.CDLL(ctypes.util.find_library('dl'))
+        libdl.dlsym.restype = ctypes.c_void_p
+        libdl.dlsym.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        psym = libdl.dlsym(None, b'mkl_serv_intel_cpu_true')
+
+        if psym:
+            psym_func = ctypes.CFUNCTYPE(ctypes.c_int)(psym)
+            _mkl_is_crippled = psym_func() != 1
+    except:
+        pass
+    
+    if _mkl_is_crippled:
+        if _cpu_supports_bf16:
+            logging.info("CPU supports avx512_bf16 instructions, but MKL degrades performance in current setup.")
+        elif has_avx512f:
+            logging.info("CPU supports avx512 (without bf16), but MKL degrades performance in current setup.")
+
+def mkl_is_crippled() -> bool:
+    _collect_cpu_info()
+    return _mkl_is_crippled
+
+def cpu_supports_bf16() -> bool:
+    _collect_cpu_info()
+    return _cpu_supports_bf16

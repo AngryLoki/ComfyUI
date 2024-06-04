@@ -1,7 +1,8 @@
 import psutil
 import logging
 from enum import Enum
-from comfy.cli_args import args
+from comfy.cli_args import args, CpuIpexMode, IpexBf16Mode
+from comfy.utils import mkl_is_crippled, cpu_supports_bf16
 import torch
 import sys
 import platform
@@ -27,6 +28,7 @@ cpu_state = CPUState.GPU
 total_vram = 0
 
 lowvram_available = True
+ipex_available = False
 xpu_available = False
 
 if args.deterministic:
@@ -47,11 +49,20 @@ if args.directml is not None:
     lowvram_available = False #TODO: need to find a way to get free memory in directml before this can be enabled by default.
 
 try:
-    import intel_extension_for_pytorch as ipex
-    if torch.xpu.is_available():
-        xpu_available = True
-except:
-    pass
+    if not args.cpu or (args.cpu and args.use_ipex != CpuIpexMode.No):
+        import intel_extension_for_pytorch as ipex
+        ipex_available = True
+
+        if torch.xpu.is_available():
+            xpu_available = True
+
+        if not xpu_available and args.cpu and args.use_ipex == CpuIpexMode.Auto and mkl_is_crippled():
+            logging.warning("IPEX is installed but disabled because it degrades performance.")
+            logging.warning('Please apply LD_PRELOAD as described in README.md or launch with "--use-ipex=yes" to ignore this check.')
+            ipex_available = False
+except Exception as e:
+    if args.cpu and args.use_ipex == CpuIpexMode.Yes:
+        logging.warning(f'Ignoring "--use-ipex=yes" option as intel_extension_for_pytorch import failed with error: {e}.')
 
 try:
     if torch.backends.mps.is_available():
@@ -62,14 +73,22 @@ except:
 
 if args.cpu:
     cpu_state = CPUState.CPU
+    
+def is_cpu_with_ipex():
+    return cpu_state == CPUState.CPU and ipex_available
 
 def is_intel_xpu():
-    global cpu_state
-    global xpu_available
-    if cpu_state == CPUState.GPU:
-        if xpu_available:
-            return True
-    return False
+    return cpu_state == CPUState.GPU and xpu_available
+
+def use_cpu_ipex_bf16():
+    if args.use_ipex_bf16 == IpexBf16Mode.No or not is_cpu_with_ipex() or not ipex._C.onednn_has_bf16_support():
+        return False
+    if args.use_ipex_bf16 == IpexBf16Mode.Yes:
+        if not is_cpu_with_ipex() or not ipex._C.onednn_has_bf16_support():
+            logging.warning('Ignoring "--use-ipex-bf16=yes" option as current system does not support bf16 operations')
+            return False
+        return True
+    return cpu_supports_bf16()
 
 def get_torch_device():
     global directml_enabled
@@ -183,10 +202,10 @@ try:
 except:
     pass
 
-if is_intel_xpu():
+if is_intel_xpu() or use_cpu_ipex_bf16():
     VAE_DTYPE = torch.bfloat16
 
-if args.cpu_vae:
+if args.cpu_vae and not use_cpu_ipex_bf16():
     VAE_DTYPE = torch.float32
 
 if args.fp16_vae:
@@ -305,8 +324,10 @@ class LoadedModel:
             self.model_unload()
             raise e
 
-        if is_intel_xpu() and not args.disable_ipex_optimize:
-            self.real_model = ipex.optimize(self.real_model.eval(), graph_mode=True, concat_linear=True)
+        if (is_cpu_with_ipex() or is_intel_xpu()) and not args.disable_ipex_optimize:
+            ipex_dtype = torch.bfloat16 if use_cpu_ipex_bf16() else None
+            self.real_model = ipex.optimize(self.real_model.eval(), dtype=ipex_dtype, graph_mode=True, concat_linear=True)
+            self.real_model = torch.compile(self.real_model, backend="ipex")
 
         self.weights_loaded = True
         return self.real_model
@@ -545,7 +566,9 @@ def unet_dtype(device=None, model_params=0, supported_dtypes=[torch.float16, tor
             return torch.float16
     if should_use_bf16(device, model_params=model_params, manual_cast=True):
         if torch.bfloat16 in supported_dtypes:
+            print("Using supported bf16 unet")
             return torch.bfloat16
+    print("Using float32 unet")
     return torch.float32
 
 # None means no manual cast
@@ -861,9 +884,11 @@ def should_use_fp16(device=None, model_params=0, prioritize_performance=True, ma
     return True
 
 def should_use_bf16(device=None, model_params=0, prioritize_performance=True, manual_cast=False):
-    if device is not None:
-        if is_device_cpu(device): #TODO ? bf16 works on CPU but is extremely slow
-            return False
+    if is_cpu_with_ipex():
+        return use_cpu_ipex_bf16()
+
+    if device is not None and is_device_cpu(device):
+        return use_cpu_ipex_bf16()
 
     if device is not None: #TODO not sure about mps bf16 support
         if is_device_mps(device):
